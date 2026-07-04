@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kinorium"
+version = "0.1.0"
+description = "A Python wrapper for the Kinorium API"
+readme = "README.md"
+authors = [
+    { name = "Orivo Contributors" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.7"
+dependencies = [
+    "requests>=2.25.0",
+]
+
+[project.scripts]
+kinorium-auth = "kinorium.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kinorium*"]
