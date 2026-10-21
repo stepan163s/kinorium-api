@@ -108,13 +108,15 @@ class TestKinoriumClientRequests(unittest.TestCase):
     @patch("requests.Session.request")
     def test_post_request_signing_and_body(self, mock_request):
         mock_response = MagicMock()
+        mock_response.cookies = requests.cookies.RequestsCookieJar()
+        mock_response.cookies.set("auth", "test-auth", domain="api.kinorium.com")
         mock_response.json.return_value = {"resultCode": 0, "data": {"user": "test"}}
         mock_response.content = b'{"resultCode": 0, "data": {"user": "test"}}'
         mock_response.status_code = 200
         mock_request.return_value = mock_response
 
         client = KinoriumClient()
-        client.authenticate("test@example.com", "pass123")
+        client.request("POST", "userAuth", data={"email": "test@example.com", "password": "pass123"})
 
         expected_url = (
             "https://api.kinorium.com/1.0.3/"
@@ -124,7 +126,7 @@ class TestKinoriumClientRequests(unittest.TestCase):
         mock_request.assert_called_once_with(
             'POST',
             expected_url,
-            json={"email": "test@example.com", "password": "pass123"},
+            data={"email": "test@example.com", "password": "pass123"},
             timeout=10
         )
 
@@ -170,9 +172,9 @@ class TestKinoriumClientRequests(unittest.TestCase):
         mock_request.return_value = mock_response
 
         client = KinoriumClient()
-        result = client.request("GET", "getMovie", params={"id": 12345})
+        result = client.request("GET", "getMovie", params={"movie_id": 12345})
 
-        expected_key = hashlib.md5(b"?method=getMovie&id=12345Sole8dya$ovbDi9I$adta").hexdigest()
-        expected_url = f"https://api.kinorium.com/1.0.3/?method=getMovie&id=12345&key={expected_key}"
+        expected_key = hashlib.md5(b"?method=getMovie&movie_id=12345Sole8dya$ovbDi9I$adta").hexdigest()
+        expected_url = f"https://api.kinorium.com/1.0.3/?method=getMovie&movie_id=12345&key={expected_key}"
         mock_request.assert_called_once_with('GET', expected_url, timeout=10)
         self.assertEqual(result["data"]["movie"], "Inception")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union
+from typing import Any, ClassVar, Dict, List, Optional, Type, TypeVar, Union, get_type_hints
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,7 @@ class BaseObject:
 
 class BaseModel(BaseObject):
     _id_attrs: tuple = ()
+    _field_aliases: ClassVar[Dict[str, str]] = {}
 
     @classmethod
     def is_dict_model_data(cls, data: Any) -> bool:
@@ -52,7 +53,7 @@ class BaseModel(BaseObject):
 
     @classmethod
     def is_array_model_data(cls, data: Any) -> bool:
-        return isinstance(data, list) and bool(data) and (len(data) == 0 or isinstance(data[0], dict))
+        return isinstance(data, list)
 
     @classmethod
     def cleanup_data(cls, data: JSONType, client: Any) -> JSONType:
@@ -63,7 +64,12 @@ class BaseModel(BaseObject):
         unknown: JSONType = {}
 
         for k, v in data.items():
-            (clean if k in known else unknown)[k] = v
+            name = cls._field_aliases.get(k, k)
+            if name in known:
+                if name not in clean or name == k:
+                    clean[name] = v
+            else:
+                unknown[k] = v
 
         if unknown and getattr(client, 'report_unknown_fields', False):
             logger.warning('%s: unknown API fields: %s', cls.__name__, list(unknown))
@@ -72,16 +78,21 @@ class BaseModel(BaseObject):
 
     @classmethod
     def de_json(cls: Type[Self], data: Any, client: Any = None) -> Optional[Self]:
+        if isinstance(data, dict) and 'data' in data and (
+            'result_code' in data or 'resultCode' in data
+        ):
+            data = data['data']
         if not cls.is_dict_model_data(data):
             return None
             
         cls_data = cls.cleanup_data(data, client)
+        field_types = get_type_hints(cls)
         
         # Recursively deserialize fields representing other BaseModel classes
         for f in dataclasses.fields(cls):
             if f.name in cls_data:
                 val = cls_data[f.name]
-                field_type = f.type
+                field_type = field_types.get(f.name, f.type)
                 actual_type = cls._get_actual_type(field_type)
                 
                 if isinstance(actual_type, type) and issubclass(actual_type, BaseModel):

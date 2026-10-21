@@ -3,9 +3,8 @@ class ApiError(Exception):
     pass
 
 
-class KinoriumError(ApiError):
-    """Alias for ApiError for backwards compatibility."""
-    pass
+# Preserve the historical name as an actual alias, so it catches every error.
+KinoriumError = ApiError
 
 
 class NetworkError(ApiError):

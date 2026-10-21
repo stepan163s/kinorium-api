@@ -1,29 +1,14 @@
-import json
-import re
 import requests
 from typing import Any, Dict, Optional, Tuple
-import hashlib
-import urllib.parse
 from kinorium.exceptions import (
-    BadRequestError,
+    AuthenticationError,
     NetworkError,
-    NotFoundError,
     TimedOutError,
-    UnauthorizedError,
-    KinoriumAPIError,
-    InvalidKeyError
 )
-
-_RESERVED = frozenset({
-    'type', 'from', 'import', 'class', 'return', 'pass',
-    'in', 'is', 'format', 'filter', 'id', 'input', 'list',
-    'dict', 'set', 'max', 'min', 'sum', 'map', 'zip',
-})
-
-_CAMEL_RE = re.compile(r'(?<=[a-z0-9])([A-Z])')
-
-def _camel_to_snake(name: str) -> str:
-    return _CAMEL_RE.sub(r'_\1', name).lower()
+from .protocol import (
+    canonicalize_and_sign, extract_error, form_data, normalize_keys, parse_response,
+    post_params, raise_for_status,
+)
 
 
 class Request:
@@ -42,6 +27,7 @@ class Request:
         self.base_url = base_url
         self.user_agent = user_agent
         self._timeout = timeout
+        self._response_auth_issued = False
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": user_agent
@@ -52,30 +38,10 @@ class Request:
             self._session.cookies.set("PHPSESSID", phpsessid)
 
     def _normalize_keys(self, obj: dict) -> dict:
-        result: dict = {}
-        for key, value in obj.items():
-            key = key.replace('-', '_')
-            key = _camel_to_snake(key)
-            key = key.lower()
-            if key in _RESERVED:
-                key += '_'
-            if key and key[0].isdigit():
-                key = '_' + key
-            result[key] = value
-        return result
+        return normalize_keys(obj)
 
     def _canonicalize_and_sign(self, method: str, params: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
-        query_items = [("method", method)]
-        if params:
-            for k, v in params.items():
-                if k not in ("method", "key"):
-                    val_str = str(v) if v is not None else ""
-                    query_items.append((k, val_str))
-        encoded = urllib.parse.urlencode(query_items, quote_via=urllib.parse.quote)
-        canonical = encoded.replace("+", "%20").replace("%2F", "/").replace("%2f", "/").replace("%3F", "?").replace("%3f", "?")
-        sign_input = f"?{canonical}{self.api_salt}"
-        key = hashlib.md5(sign_input.encode("utf-8")).hexdigest()
-        return canonical, key
+        return canonicalize_and_sign(method, params, self.api_salt)
 
     def get(self, api_method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         canonical_query, key = self._canonicalize_and_sign(api_method, params)
@@ -84,10 +50,15 @@ class Request:
         return self._parse(content)
 
     def post(self, api_method: str, params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        canonical_query, key = self._canonicalize_and_sign(api_method, params)
+        query = post_params(api_method, params, data)
+        canonical_query, key = self._canonicalize_and_sign(api_method, query)
         url = f"{self.base_url}?{canonical_query}&key={key}"
-        content = self._request_wrapper('POST', url, json=data)
-        return self._parse(content)
+        self._response_auth_issued = False
+        content = self._request_wrapper('POST', url, data=form_data(data))
+        result = self._parse(content)
+        if api_method == "userAuth" and not self._response_auth_issued:
+            raise AuthenticationError("Server did not issue an auth cookie")
+        return result
 
     def delete(self, api_method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         canonical_query, key = self._canonicalize_and_sign(api_method, params)
@@ -108,37 +79,20 @@ class Request:
         except requests.RequestException as exc:
             raise NetworkError(str(exc)) from exc
 
-        if not (200 <= resp.status_code <= 299):
-            message = self._extract_error(resp.content)
-            if resp.status_code in (401, 403):
-                raise UnauthorizedError(message)
-            if resp.status_code == 400:
-                raise BadRequestError(message)
-            if resp.status_code == 404:
-                raise NotFoundError(message)
-            raise NetworkError(f"HTTP {resp.status_code}: {message}")
-
+        raise_for_status(resp.status_code, resp.content)
+        self._response_auth_issued = any(c.name == "auth" and bool(c.value) for c in resp.cookies)
+        # Constructor cookies have no domain. Once the server issues a scoped
+        # replacement, remove the old unscoped cookie to avoid sending both or
+        # raising CookieConflictError when the client reads the new session.
+        for issued in resp.cookies:
+            if issued.name in ("auth", "PHPSESSID") and issued.domain:
+                for old in list(self._session.cookies):
+                    if old.name == issued.name and not old.domain:
+                        self._session.cookies.clear(old.domain, old.path, old.name)
         return resp.content
 
     def _extract_error(self, content: bytes) -> str:
-        try:
-            data = json.loads(content)
-            return data.get('message') or data.get('error') or 'Unknown error'
-        except Exception:
-            return content.decode('utf-8', errors='replace') or 'Unknown error'
+        return extract_error(content)
 
     def _parse(self, content: bytes) -> Dict[str, Any]:
-        if not content:
-            return {}
-        json_data = json.loads(content, object_hook=self._normalize_keys)
-        
-        if isinstance(json_data, dict) and json_data.get("key") is False:
-            raise InvalidKeyError()
-            
-        if isinstance(json_data, dict) and "result_code" in json_data:
-            rc = json_data.get("result_code")
-            if rc != 0:
-                rm = json_data.get("result_message", "Unknown API error")
-                raise KinoriumAPIError(rc, rm)
-                
-        return json_data
+        return parse_response(content)

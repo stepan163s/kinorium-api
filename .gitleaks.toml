@@ -1,0 +1,14 @@
+title = "Kinorium secret scanning"
+
+[extend]
+useDefault = true
+
+# Public deterministic test outputs, recomputed from the request/WS signing
+# algorithm. These are not cookies, account tokens or login credentials.
+[[allowlists]]
+description = "Four known signature test vectors in test_signing.py only"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tests/test_signing\.py$''']
+regexTarget = "secret"
+regexes = ['''^(77cb7d6ad06161f7923cc74c0fd88466|1d632c88e2b4114aff633a9737741ae2|478cc9984f5940e8ab9d64d08b4abe20|aeee25a24d3d2ebb4128fcddda0dc956)$''']

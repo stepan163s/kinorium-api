@@ -7,7 +7,7 @@
 import hashlib
 from typing import Dict, Any, Optional
 from kinorium.utils.request_async import RequestAsync as Request
-from kinorium.exceptions import KinoriumError, AuthenticationError
+from kinorium.exceptions import KinoriumError, AuthenticationError, InvalidOptionError
 
 class KinoriumClientAsync:
     DEFAULT_BASE_URL = "https://api.kinorium.com/1.0.3/"
@@ -61,9 +61,21 @@ class KinoriumClientAsync:
         """
         Sends a signed request to the Kinorium API.
         """
-        if http_method.upper() == "POST":
+        verb = http_method.upper()
+        if verb not in ("GET", "POST", "DELETE"):
+            raise InvalidOptionError(f"Unsupported HTTP method: {http_method}")
+        if verb == "DELETE" and api_method == "removeMovieStatus":
+            # The server implements this deletion as a signed POST. Omitting
+            # type=status returns success without clearing the current status.
+            params = dict(params or {})
+            if "type" not in params and "type" not in (data or {}):
+                params["type"] = "status"
             return await self._request.post(api_method, params=params, data=data)
-        elif http_method.upper() == "DELETE":
+        if verb == "POST":
+            return await self._request.post(api_method, params=params, data=data)
+        if data:
+            raise InvalidOptionError("Use params for GET/DELETE; data is supported for POST and DELETE removeMovieStatus")
+        if verb == "DELETE":
             return await self._request.delete(api_method, params=params)
         else:
             return await self._request.get(api_method, params=params)
@@ -78,6 +90,8 @@ class KinoriumClientAsync:
         }
         try:
             res = await self._request.post("userAuth", data=data)
+            if not self.auth_cookie:
+                raise AuthenticationError("Server did not issue an auth cookie")
             return res
         except KinoriumError as e:
             raise AuthenticationError(f"Authentication failed: {e}") from e
@@ -87,6 +101,24 @@ class KinoriumClientAsync:
         Fetches user profile data. Works for public profile data.
         """
         return await self._request.get("getUserInfo", params={"user_id": user_id})
+
+    async def get_movie(self, movie_id: int) -> Dict[str, Any]:
+        """Fetch movie details using the movie_id parameter expected by the API."""
+        return await self._request.get("getMovie", params={"movie_id": movie_id})
+
+    async def set_movie_status(self, movie_id: int, status: str) -> Dict[str, Any]:
+        """Set a movie status (done, future or never)."""
+        if status not in ("done", "future", "never"):
+            raise InvalidOptionError("Supported movie statuses: done, future, never")
+        return await self.request("POST", "setMovieStatus", data={
+            "movie_id": movie_id, "status": status,
+        })
+
+    async def remove_movie_status(self, movie_id: int) -> Dict[str, Any]:
+        """Remove the current movie status using the server's POST endpoint."""
+        return await self.request("POST", "removeMovieStatus", data={
+            "movie_id": movie_id, "type": "status",
+        })
 
     async def get_user_lists(self, user_id: int = 0) -> Dict[str, Any]:
         """

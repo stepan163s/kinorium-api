@@ -1,30 +1,16 @@
-import json
-import re
 import aiohttp
 import asyncio
+from yarl import URL
 from typing import Any, Dict, Optional, Tuple
-import hashlib
-import urllib.parse
 from kinorium.exceptions import (
-    BadRequestError,
+    AuthenticationError,
     NetworkError,
-    NotFoundError,
     TimedOutError,
-    UnauthorizedError,
-    KinoriumAPIError,
-    InvalidKeyError
 )
-
-_RESERVED = frozenset({
-    'type', 'from', 'import', 'class', 'return', 'pass',
-    'in', 'is', 'format', 'filter', 'id', 'input', 'list',
-    'dict', 'set', 'max', 'min', 'sum', 'map', 'zip',
-})
-
-_CAMEL_RE = re.compile(r'(?<=[a-z0-9])([A-Z])')
-
-def _camel_to_snake(name: str) -> str:
-    return _CAMEL_RE.sub(r'_\1', name).lower()
+from .protocol import (
+    canonicalize_and_sign, form_data, normalize_keys, parse_response, post_params,
+    raise_for_status,
+)
 
 
 class RequestAsync:
@@ -49,30 +35,10 @@ class RequestAsync:
         self.phpsessid = phpsessid
 
     def _normalize_keys(self, obj: dict) -> dict:
-        result: dict = {}
-        for key, value in obj.items():
-            key = key.replace('-', '_')
-            key = _camel_to_snake(key)
-            key = key.lower()
-            if key in _RESERVED:
-                key += '_'
-            if key and key[0].isdigit():
-                key = '_' + key
-            result[key] = value
-        return result
+        return normalize_keys(obj)
 
     def _canonicalize_and_sign(self, method: str, params: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
-        query_items = [("method", method)]
-        if params:
-            for k, v in params.items():
-                if k not in ("method", "key"):
-                    val_str = str(v) if v is not None else ""
-                    query_items.append((k, val_str))
-        encoded = urllib.parse.urlencode(query_items, quote_via=urllib.parse.quote)
-        canonical = encoded.replace("+", "%20").replace("%2F", "/").replace("%2f", "/").replace("%3F", "?").replace("%3f", "?")
-        sign_input = f"?{canonical}{self.api_salt}"
-        key = hashlib.md5(sign_input.encode("utf-8")).hexdigest()
-        return canonical, key
+        return canonicalize_and_sign(method, params, self.api_salt)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -86,35 +52,28 @@ class RequestAsync:
         return self.session
 
     async def _handle_response(self, response: aiohttp.ClientResponse) -> Dict[str, Any]:
-        if response.status in (401, 403):
-            raise UnauthorizedError(f"HTTP {response.status}: Unauthorized")
-        elif response.status == 400:
-            raise BadRequestError("HTTP 400: Bad Request")
-        elif response.status == 404:
-            raise NotFoundError("HTTP 404: Not Found")
-        elif response.status >= 500:
-            raise NetworkError(f"Server error HTTP {response.status}")
-            
         text = await response.text()
-        try:
-            json_data = json.loads(text, object_hook=self._normalize_keys)
-        except json.JSONDecodeError:
-            raise KinoriumAPIError(-1, f"Failed to parse JSON response: {text}")
-            
-        if isinstance(json_data, dict) and json_data.get("key") is False:
-            raise InvalidKeyError()
-            
-        if isinstance(json_data, dict) and "result_code" in json_data:
-            rc = json_data.get("result_code")
-            if rc != 0:
-                rm = json_data.get("result_message", "Unknown API error")
-                raise KinoriumAPIError(rc, rm)
-                
-        return json_data
+        if self.session is not None:
+            # Remove constructor cookies superseded by scoped Set-Cookie values.
+            # Refresh on every response, including cookie rotation outside login.
+            for name in ("auth", "PHPSESSID"):
+                if name in response.cookies:
+                    self.session.cookie_jar.clear(
+                        lambda cookie, name=name: cookie.key == name and not cookie["domain"]
+                    )
+            cookies = self.session.cookie_jar.filter_cookies(response.url)
+            for name, attribute in (("auth", "auth"), ("PHPSESSID", "phpsessid")):
+                cookie = cookies.get(name)
+                if cookie is None:
+                    setattr(self, attribute, None)
+                elif isinstance(cookie.value, str):
+                    setattr(self, attribute, cookie.value or None)
+        raise_for_status(response.status, text)
+        return parse_response(text)
 
     async def get(self, api_method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         canonical_query, key = self._canonicalize_and_sign(api_method, params)
-        url = f"{self.base_url}?{canonical_query}&key={key}"
+        url = URL(f"{self.base_url}?{canonical_query}&key={key}", encoded=True)
         session = await self._get_session()
         try:
             async with session.get(url, timeout=self._timeout) as response:
@@ -125,12 +84,18 @@ class RequestAsync:
             raise NetworkError(str(e))
 
     async def post(self, api_method: str, params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        canonical_query, key = self._canonicalize_and_sign(api_method, params)
-        url = f"{self.base_url}?{canonical_query}&key={key}"
+        query = post_params(api_method, params, data)
+        canonical_query, key = self._canonicalize_and_sign(api_method, query)
+        url = URL(f"{self.base_url}?{canonical_query}&key={key}", encoded=True)
         session = await self._get_session()
         try:
-            async with session.post(url, json=data, timeout=self._timeout) as response:
-                return await self._handle_response(response)
+            async with session.post(url, timeout=self._timeout, data=form_data(data)) as response:
+                result = await self._handle_response(response)
+                if api_method == "userAuth":
+                    issued = response.cookies.get("auth")
+                    if issued is None or not issued.value:
+                        raise AuthenticationError("Server did not issue an auth cookie")
+                return result
         except asyncio.TimeoutError:
             raise TimedOutError("Request timed out")
         except aiohttp.ClientError as e:
@@ -138,7 +103,7 @@ class RequestAsync:
 
     async def delete(self, api_method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         canonical_query, key = self._canonicalize_and_sign(api_method, params)
-        url = f"{self.base_url}?{canonical_query}&key={key}"
+        url = URL(f"{self.base_url}?{canonical_query}&key={key}", encoded=True)
         session = await self._get_session()
         try:
             async with session.delete(url, timeout=self._timeout) as response:

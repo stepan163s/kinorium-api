@@ -1,0 +1,6 @@
+include README.md CHANGELOG.md TEST_REPORT.md get_session.py generate_async_version.py
+recursive-include tests *.py
+global-exclude *.local.json *.local.md *.local.log .env .env.* *.pem *.key
+global-exclude *cookies*.json *cookies*.txt *token*.json
+global-exclude live_api_report*.json kinorium-live-audit*.json
+global-exclude *.pyc .DS_Store
